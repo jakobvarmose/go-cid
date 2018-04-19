@@ -21,14 +21,15 @@ package cid
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
-	mbase "github.com/multiformats/go-multibase"
-	mh "github.com/multiformats/go-multihash"
+	mh "gx/ipfs/QmZyZDi491cCNTLfAhwcaDii2Kg4pwKRkhqQzURGDvY6ua/go-multihash"
+	mbase "gx/ipfs/QmexBtiTTEwwn42Yi6ouKt6VqzpA6wjJgiW1oh9VfaRrup/go-multibase"
 )
 
 // UnsupportedVersionString just holds an error message
@@ -144,6 +145,18 @@ func NewCidV1(codecType uint64, mhash mh.Multihash) *Cid {
 	}
 }
 
+// NewCidV1 returns a new Cid using the given key type and multicodec-packed
+// content type.
+func NewCidV4(codecType, keyType uint64, key []byte, mhash mh.Multihash) *Cid {
+	return &Cid{
+		version: 4,
+		codec:   codecType,
+		keyType: keyType,
+		key:     key,
+		hash:    mhash,
+	}
+}
+
 // NewPrefixV0 returns a CIDv0 prefix with the specified multihash type.
 func NewPrefixV0(mhType uint64) Prefix {
 	return Prefix{
@@ -165,12 +178,26 @@ func NewPrefixV1(codecType uint64, mhType uint64) Prefix {
 	}
 }
 
+// NewPrefixV4 returns a CIDv4 prefix with the specified codec, key type
+// and multihash type.
+func NewPrefixV4(codecType, keyType, mhType uint64) Prefix {
+	return Prefix{
+		MhType:   mhType,
+		MhLength: mh.DefaultLengths[mhType],
+		Version:  1,
+		Codec:    codecType,
+		KeyType:  keyType,
+	}
+}
+
 // Cid represents a self-describing content adressed
 // identifier. It is formed by a Version, a Codec (which indicates
 // a multicodec-packed content type) and a Multihash.
 type Cid struct {
 	version uint64
 	codec   uint64
+	keyType uint64
+	key     []byte
 	hash    mh.Multihash
 }
 
@@ -268,17 +295,41 @@ func Cast(data []byte) (*Cid, error) {
 	if err := uvError(n); err != nil {
 		return nil, err
 	}
+	rest := data[n:]
 
-	if vers != 0 && vers != 1 {
+	if vers != 0 && vers != 1 && vers != 4 {
 		return nil, fmt.Errorf("invalid cid version number: %d", vers)
 	}
 
-	codec, cn := binary.Uvarint(data[n:])
-	if err := uvError(cn); err != nil {
+	codec, n := binary.Uvarint(rest)
+	if err := uvError(n); err != nil {
 		return nil, err
 	}
+	rest = rest[n:]
 
-	rest := data[n+cn:]
+	var keyType uint64
+	var key []byte
+	if vers == 4 {
+		keyType, n = binary.Uvarint(rest)
+		if err := uvError(n); err != nil {
+			return nil, err
+		}
+		rest = rest[n:]
+
+		keyLen, n := binary.Uvarint(rest)
+		if err := uvError(n); err != nil {
+			return nil, err
+		}
+		rest = rest[n:]
+
+		if keyLen > uint64(len(rest)) {
+			return nil, errors.New("key length inconsistent")
+		}
+
+		key = rest[:keyLen]
+		rest = rest[keyLen:]
+	}
+
 	h, err := mh.Cast(rest)
 	if err != nil {
 		return nil, err
@@ -287,6 +338,8 @@ func Cast(data []byte) (*Cid, error) {
 	return &Cid{
 		version: vers,
 		codec:   codec,
+		keyType: keyType,
+		key:     key,
 		hash:    h,
 	}, nil
 }
@@ -294,6 +347,14 @@ func Cast(data []byte) (*Cid, error) {
 // Type returns the multicodec-packed content type of a Cid.
 func (c *Cid) Type() uint64 {
 	return c.codec
+}
+
+func (c *Cid) KeyType() uint64 {
+	return c.keyType
+}
+
+func (c *Cid) SecretKey() []byte {
+	return c.key
 }
 
 // String returns the default string representation of a
@@ -305,6 +366,13 @@ func (c *Cid) String() string {
 		return c.hash.B58String()
 	case 1:
 		mbstr, err := mbase.Encode(mbase.Base58BTC, c.bytesV1())
+		if err != nil {
+			panic("should not error with hardcoded mbase: " + err.Error())
+		}
+
+		return mbstr
+	case 4:
+		mbstr, err := mbase.Encode(mbase.Base58BTC, c.bytesV4())
 		if err != nil {
 			panic("should not error with hardcoded mbase: " + err.Error())
 		}
@@ -326,6 +394,8 @@ func (c *Cid) StringOfBase(base mbase.Encoding) (string, error) {
 		return c.hash.B58String(), nil
 	case 1:
 		return mbase.Encode(base, c.bytesV1())
+	case 4:
+		return mbase.Encode(base, c.bytesV4())
 	default:
 		panic("not possible to reach this point")
 	}
@@ -345,6 +415,8 @@ func (c *Cid) Bytes() []byte {
 		return c.bytesV0()
 	case 1:
 		return c.bytesV1()
+	case 4:
+		return c.bytesV4()
 	default:
 		panic("not possible to reach this point")
 	}
@@ -367,12 +439,26 @@ func (c *Cid) bytesV1() []byte {
 	return buf[:n+len(c.hash)]
 }
 
+func (c *Cid) bytesV4() []byte {
+	// four 8 bytes (max) numbers plus key plus hash
+	buf := make([]byte, 4*binary.MaxVarintLen64+len(c.key)+len(c.hash))
+	n := binary.PutUvarint(buf, c.version)
+	n += binary.PutUvarint(buf[n:], c.codec)
+	n += binary.PutUvarint(buf[n:], c.keyType)
+	n += binary.PutUvarint(buf[n:], uint64(len(c.key)))
+	n += copy(buf[n:], c.key)
+	n += copy(buf[n:], c.hash)
+	return buf[:n]
+}
+
 // Equals checks that two Cids are the same.
 // In order for two Cids to be considered equal, the
 // Version, the Codec and the Multihash must match.
 func (c *Cid) Equals(o *Cid) bool {
 	return c.codec == o.codec &&
 		c.version == o.version &&
+		c.keyType == o.keyType &&
+		subtle.ConstantTimeCompare(c.key, o.key) == 1 &&
 		bytes.Equal(c.hash, o.hash)
 }
 
@@ -398,9 +484,7 @@ func (c *Cid) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	c.version = out.version
-	c.hash = out.hash
-	c.codec = out.codec
+	*c = *out
 	return nil
 }
 
@@ -435,6 +519,7 @@ func (c *Cid) Prefix() Prefix {
 		MhLength: dec.Length,
 		Version:  c.version,
 		Codec:    c.codec,
+		KeyType:  c.keyType,
 	}
 }
 
@@ -447,6 +532,7 @@ type Prefix struct {
 	Codec    uint64
 	MhType   uint64
 	MhLength int
+	KeyType  uint64
 }
 
 // Sum uses the information in a prefix to perform a multihash.Sum()
@@ -462,6 +548,8 @@ func (p Prefix) Sum(data []byte) (*Cid, error) {
 		return NewCidV0(hash), nil
 	case 1:
 		return NewCidV1(p.Codec, hash), nil
+	case 4:
+		return nil, fmt.Errorf("version 4 prefix does not support sum")
 	default:
 		return nil, fmt.Errorf("invalid cid version")
 	}
@@ -476,6 +564,9 @@ func (p Prefix) Bytes() []byte {
 	n += binary.PutUvarint(buf[n:], p.Codec)
 	n += binary.PutUvarint(buf[n:], uint64(p.MhType))
 	n += binary.PutUvarint(buf[n:], uint64(p.MhLength))
+	if p.Version == 4 {
+		n += binary.PutUvarint(buf[n:], p.KeyType)
+	}
 	return buf[:n]
 }
 
@@ -503,10 +594,26 @@ func PrefixFromBytes(buf []byte) (Prefix, error) {
 		return Prefix{}, err
 	}
 
+	var keyType uint64
+	if vers == 4 {
+		keyType, err = binary.ReadUvarint(r)
+		if err != nil {
+			return Prefix{}, err
+		}
+	}
+
 	return Prefix{
 		Version:  vers,
 		Codec:    codec,
 		MhType:   mhtype,
 		MhLength: int(mhlen),
+		KeyType:  keyType,
 	}, nil
+}
+
+func (c *Cid) ToPublic() *Cid {
+	if c.version == 4 {
+		return NewCidV1(Raw, c.hash)
+	}
+	return c
 }
